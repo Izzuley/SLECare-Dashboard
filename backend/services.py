@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import math
 import pickle
+from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -60,6 +62,9 @@ CLINICAL_MEANINGS = {
     "CKD": "CKD status contributes to delayed-remission risk in the model",
     "RACE": "race code is associated with different predicted risk patterns in the model",
 }
+
+PREDICTION_CACHE_MAX_SIZE = 256
+_PREDICTION_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
 def _clean_value(value: Any) -> Any:
@@ -140,6 +145,53 @@ def _feature_frame(values: dict[str, Any], features: list[str], source: pd.DataF
     return pd.DataFrame([row], columns=features)
 
 
+def _apply_categorical_casts(model: Any, frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    for index in model.get_cat_feature_indices():
+        feature = features[index]
+        frame[feature] = frame[feature].round().astype(int)
+    return frame
+
+
+def _prepared_frame(
+    model_name: str, features: list[str], source: pd.DataFrame, values: dict[str, Any]
+) -> tuple[Any, pd.DataFrame]:
+    frame = _feature_frame(values, features, source)
+    model = _ckd_model() if model_name == "ckd" else _remission_model()
+    return model, _apply_categorical_casts(model, frame, features)
+
+
+def _prediction_cache_key(inputs: dict[str, Any], patient_ref: str | None) -> str:
+    ckd_features = _ckd_features()
+    remission_features = _remission_features()
+    _, ckd_frame = _prepared_frame("ckd", ckd_features, _ckd_df(), inputs)
+    _, remission_frame = _prepared_frame("remission", remission_features, _remission_df(), inputs)
+    key_payload = {
+        "patientRef": patient_ref or "Manual input",
+        "ckd": [_clean_value(ckd_frame.iloc[0][feature]) for feature in ckd_features],
+        "remission": [_clean_value(remission_frame.iloc[0][feature]) for feature in remission_features],
+    }
+    return json.dumps(key_payload, sort_keys=True, separators=(",", ":"))
+
+
+def _prediction_cache_get(cache_key: str) -> dict[str, Any] | None:
+    cached = _PREDICTION_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    _PREDICTION_CACHE.move_to_end(cache_key)
+    return deepcopy(cached)
+
+
+def _prediction_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
+    _PREDICTION_CACHE[cache_key] = deepcopy(payload)
+    _PREDICTION_CACHE.move_to_end(cache_key)
+    while len(_PREDICTION_CACHE) > PREDICTION_CACHE_MAX_SIZE:
+        _PREDICTION_CACHE.popitem(last=False)
+
+
+def _clear_prediction_cache() -> None:
+    _PREDICTION_CACHE.clear()
+
+
 def _driver_payload(feature: str, value: Any, shap_value: float, rank: int) -> dict[str, Any]:
     return {
         "feature": feature,
@@ -178,11 +230,7 @@ def _predict_one(
     source: pd.DataFrame,
     values: dict[str, Any],
 ) -> dict[str, Any]:
-    frame = _feature_frame(values, features, source)
-    model = _ckd_model() if model_name == "ckd" else _remission_model()
-    for index in model.get_cat_feature_indices():
-        feature = features[index]
-        frame[feature] = frame[feature].round().astype(int)
+    model, frame = _prepared_frame(model_name, features, source, values)
     probability = float(model.predict_proba(frame)[0][1])
     top_risk, protective = _local_shap(model_name, frame, features)
     category = _risk_category(probability)
@@ -199,11 +247,7 @@ def _predict_one(
 
 
 def _prediction_probability(model_name: str, features: list[str], source: pd.DataFrame, values: dict[str, Any]) -> float:
-    frame = _feature_frame(values, features, source)
-    model = _ckd_model() if model_name == "ckd" else _remission_model()
-    for index in model.get_cat_feature_indices():
-        feature = features[index]
-        frame[feature] = frame[feature].round().astype(int)
+    model, frame = _prepared_frame(model_name, features, source, values)
     return float(model.predict_proba(frame)[0][1])
 
 
@@ -238,6 +282,7 @@ def _fast_prediction_summary(inputs: dict[str, Any], patient_ref: str) -> dict[s
         "schemaVersion": "1.0",
         "patientRef": patient_ref,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "predictionKind": "summary",
         "predictionSource": "catboost",
         "shapSource": "mock_shap",
         "inputValidation": {"missingRequiredFields": [], "warnings": []},
@@ -295,6 +340,11 @@ def explain_payload(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def predict_patient(inputs: dict[str, Any], patient_ref: str | None = None) -> dict[str, Any]:
+    cache_key = _prediction_cache_key(inputs, patient_ref)
+    cached_result = _prediction_cache_get(cache_key)
+    if cached_result is not None:
+        return cached_result
+
     missing = [
         feature
         for feature in sorted(set(_ckd_features() + _remission_features()))
@@ -304,6 +354,7 @@ def predict_patient(inputs: dict[str, Any], patient_ref: str | None = None) -> d
         "schemaVersion": "1.0",
         "patientRef": patient_ref or "Manual input",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "predictionKind": "full",
         "predictionSource": "catboost",
         "shapSource": "local_shap",
         "inputValidation": {
@@ -334,7 +385,8 @@ def predict_patient(inputs: dict[str, Any], patient_ref: str | None = None) -> d
         ],
     }
     result["llmExplanation"] = explain_payload(result)
-    return result
+    _prediction_cache_set(cache_key, result)
+    return deepcopy(result)
 
 
 def _distribution(series: pd.Series) -> list[dict[str, Any]]:
@@ -402,7 +454,7 @@ def _patient_rows() -> list[dict[str, Any]]:
             elif feature in raw.columns:
                 inputs[feature] = _clean_value(raw_row[feature])
         ref = str(_clean_value(raw_row.get("PATIENT ID")) or f"P{index + 1:03d}")
-        prediction = _fast_prediction_summary(inputs, ref)
+        prediction = predict_patient(inputs, ref)
         ckd_outcome, remission_outcome = prediction["outcomes"]
         main_reason = ", ".join(driver["displayName"] for driver in ckd_outcome["topRiskDrivers"][:2])
         if remission_outcome["riskCategory"] == "High":

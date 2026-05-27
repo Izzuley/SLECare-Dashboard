@@ -202,13 +202,14 @@ function PatientRiskAssessment({
   setSelectedPatientId: (id: string) => void;
 }) {
   const [inputs, setInputs] = useState<Record<string, number | string | null>>(selectedPatient.inputs);
-  const [result, setResult] = useState<RiskResult>(selectedPatient.prediction);
+  const [result, setResult] = useState<RiskResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setInputs(selectedPatient.inputs);
-    setResult(selectedPatient.prediction);
+    setResult(null);
+    setError("");
   }, [selectedPatient]);
 
   const fields = useMemo(() => importantFields.filter((field) => field in inputs), [inputs]);
@@ -262,25 +263,36 @@ function PatientRiskAssessment({
             </label>
           ))}
         </div>
-        {result.inputValidation.warnings.length > 0 && (
+        {result && result.inputValidation.warnings.length > 0 && (
           <p className="mt-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
             {result.inputValidation.warnings[0]}
           </p>
         )}
         {error && <p className="mt-4 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
       </div>
-      <div className="grid gap-5 lg:grid-cols-2">
-        {result.outcomes.map((outcome) => <OutcomeCard key={outcome.target} outcome={outcome} />)}
-      </div>
-      <div className="panel p-5">
-        <div className="flex items-center gap-2">
-          <Sparkles size={18} className="text-clinical" />
-          <h2 className="text-lg font-semibold text-ink">Clinician-friendly explanation</h2>
+      {result && result.predictionKind === "full" ? (
+        <>
+          <div className="grid gap-5 lg:grid-cols-2">
+            {result.outcomes.map((outcome) => <OutcomeCard key={outcome.target} outcome={outcome} />)}
+          </div>
+          <div className="panel p-5">
+            <div className="flex items-center gap-2">
+              <Sparkles size={18} className="text-clinical" />
+              <h2 className="text-lg font-semibold text-ink">Clinician-friendly explanation</h2>
+            </div>
+            <p className="mt-3 text-slate-700">{result.llmExplanation.summary}</p>
+            <p className="mt-3 text-sm font-semibold text-slate-600">{result.llmExplanation.safetyNote}</p>
+          </div>
+          <RiskDrivers result={result} />
+        </>
+      ) : (
+        <div className="panel p-5">
+          <h2 className="text-lg font-semibold text-ink">Ready for model inference</h2>
+          <p className="mt-2 text-sm text-slate-600">
+            Select a sample patient or edit fields, then click Generate to run full CatBoost + local SHAP prediction for this assessment.
+          </p>
         </div>
-        <p className="mt-3 text-slate-700">{result.llmExplanation.summary}</p>
-        <p className="mt-3 text-sm font-semibold text-slate-600">{result.llmExplanation.safetyNote}</p>
-      </div>
-      <RiskDrivers result={result} />
+      )}
     </section>
   );
 }

@@ -34,6 +34,7 @@ export type RiskResult = {
   schemaVersion: string;
   patientRef: string;
   generatedAt: string;
+  predictionKind: "summary" | "full";
   predictionSource: "catboost" | "mock";
   shapSource: "local_shap" | "mock_shap";
   inputValidation: { missingRequiredFields: string[]; warnings: string[] };
