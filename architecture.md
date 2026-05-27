@@ -17,12 +17,12 @@ It explicitly does not provide diagnosis or treatment recommendation.
 
 ```mermaid
 flowchart LR
-  A[React + Vite Frontend\nsrc/main.tsx, src/App.tsx] -->|/api/dashboard, /api/predict| B[Flask API\nbackend/app.py]
-  B --> C[Service Layer\nbackend/services.py]
-  C --> D[(data/*.xlsx, data/*.csv)]
-  C --> E[(model/*.pkl, model/*_features.json)]
-  B --> F[/api/assets/*]
-  F --> G[(assets/*.png)]
+  A["React + Vite Frontend\nsrc/main.tsx, src/App.tsx"] -->|"/api/dashboard, /api/predict"| B["Flask API\nbackend/app.py"]
+  B --> C["Service Layer\nbackend/services.py"]
+  C --> D[("data files (.xlsx, .csv)")]
+  C --> E[("model files (.pkl, *_features.json)")]
+  B --> F["/api/assets/<path>"]
+  F --> G[("asset images (.png)")]
 ```
 
 ## 3. Graphify Knowledge-Graph Findings (Source of Architectural Orientation)
