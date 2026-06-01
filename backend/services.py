@@ -66,6 +66,23 @@ CLINICAL_MEANINGS = {
 PREDICTION_CACHE_MAX_SIZE = 256
 _PREDICTION_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
+# Clinically adjustable continuous variables for the What-If Explorer and the
+# Top Modifiable Driver Engine. Demographics (RACE/GENDER) and binary serology
+# markers are intentionally excluded - they are not clinically "modifiable" and
+# including them would weaken the model-association-only safety framing.
+# `lowerIsBetter` records the direction in which the cohort distribution is
+# considered healthier, used to pick a safe perturbation target percentile.
+MODIFIABLE_FEATURES: list[dict[str, Any]] = [
+    {"feature": "CREAT BASELINE", "lowerIsBetter": True},
+    {"feature": "ALBUMIN BASELINE", "lowerIsBetter": False},
+    {"feature": "UPCI PRE TX", "lowerIsBetter": True},
+    {"feature": "C4 PRETX", "lowerIsBetter": False},
+    {"feature": "CHRONIC INDEX", "lowerIsBetter": True},
+    {"feature": "ACTIVE INDEX", "lowerIsBetter": True},
+    {"feature": "GLOBAL SCLEROSIS", "lowerIsBetter": True},
+    {"feature": "MONTH INTERVAL TO INDUCTION TX", "lowerIsBetter": True},
+]
+
 
 def _clean_value(value: Any) -> Any:
     if value is None:
@@ -387,6 +404,245 @@ def predict_patient(inputs: dict[str, Any], patient_ref: str | None = None) -> d
     result["llmExplanation"] = explain_payload(result)
     _prediction_cache_set(cache_key, result)
     return deepcopy(result)
+
+
+def _numeric_series_for_feature(feature: str) -> pd.Series | None:
+    for source in (_ckd_df(), _remission_df(), _raw_df()):
+        if feature in source.columns:
+            values = pd.to_numeric(source[feature], errors="coerce").dropna()
+            if not values.empty:
+                return values
+    return None
+
+
+@lru_cache(maxsize=1)
+def _modifiable_ranges() -> dict[str, dict[str, float]]:
+    """Cohort percentile ranges for each modifiable feature.
+
+    Perturbation targets are drawn from the patient cohort distribution so the
+    simulated value stays in-distribution and clinically defensible.
+    """
+    ranges: dict[str, dict[str, float]] = {}
+    for spec in MODIFIABLE_FEATURES:
+        feature = spec["feature"]
+        series = _numeric_series_for_feature(feature)
+        if series is None:
+            continue
+        ranges[feature] = {
+            "p25": float(series.quantile(0.25)),
+            "p50": float(series.median()),
+            "p75": float(series.quantile(0.75)),
+            "min": float(series.min()),
+            "max": float(series.max()),
+        }
+    return ranges
+
+
+def _confidence_label(reduction: float) -> str:
+    # Deliberately cautious: cap at "Moderate" so outputs never read as
+    # treatment certainty. Framed as a model-association strength, not advice.
+    if reduction >= 0.10:
+        return "Moderate"
+    if reduction >= 0.03:
+        return "Low-Moderate"
+    return "Low"
+
+
+def find_patient_inputs(patient_ref: str | None) -> dict[str, Any] | None:
+    """Look up the model-ready inputs for a stored sample patient by reference."""
+    if not patient_ref:
+        return None
+    for row in _patient_rows():
+        if row["id"] == patient_ref:
+            return deepcopy(row["inputs"])
+    return None
+
+
+def _delta_payload(baseline: dict[str, Any], simulated: dict[str, Any]) -> dict[str, Any]:
+    base_p = baseline["probability"]
+    sim_p = simulated["probability"]
+    delta = round(sim_p - base_p, 4)
+    if delta < -0.005:
+        direction = "reduced"
+    elif delta > 0.005:
+        direction = "increased"
+    else:
+        direction = "unchanged"
+    return {
+        "target": baseline["target"],
+        "targetEvent": baseline["targetEvent"],
+        "baselineProbability": base_p,
+        "simulatedProbability": sim_p,
+        "delta": delta,
+        "deltaPercentagePoints": round(delta * 100, 1),
+        "baselineCategory": baseline["riskCategory"],
+        "simulatedCategory": simulated["riskCategory"],
+        "direction": direction,
+    }
+
+
+SAFETY_NOTE = (
+    "Analytical model-based simulation only. Outputs are model associations, "
+    "not treatment recommendations, and require clinical validation before "
+    "real-world use."
+)
+
+
+def simulate_patient(
+    patient_ref: str | None,
+    modified_inputs: dict[str, Any],
+    baseline_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Clinical What-If Explorer: re-run prediction with modified variables.
+
+    Returns the baseline prediction, the simulated prediction (each a full
+    CatBoost + local SHAP RiskResult), and per-outcome deltas.
+    """
+    if baseline_inputs is None:
+        baseline_inputs = find_patient_inputs(patient_ref)
+    if baseline_inputs is None:
+        baseline_inputs = {}
+
+    sanitized: dict[str, Any] = {}
+    for key, value in (modified_inputs or {}).items():
+        if value in (None, ""):
+            continue
+        try:
+            sanitized[key] = float(value)
+        except (TypeError, ValueError):
+            sanitized[key] = value
+
+    simulated_inputs = {**baseline_inputs, **sanitized}
+
+    baseline = predict_patient(baseline_inputs, patient_ref)
+    sim_label = f"{patient_ref} (simulated)" if patient_ref else "Manual input (simulated)"
+    simulated = predict_patient(simulated_inputs, sim_label)
+
+    deltas = [
+        _delta_payload(b, s)
+        for b, s in zip(baseline["outcomes"], simulated["outcomes"])
+    ]
+
+    return {
+        "schemaVersion": "1.0",
+        "patientRef": patient_ref or "Manual input",
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "modifiedInputs": {k: _clean_value(v) for k, v in sanitized.items()},
+        "baseline": baseline,
+        "simulated": simulated,
+        "deltas": deltas,
+        "safetyNote": SAFETY_NOTE,
+    }
+
+
+def _target_specs() -> list[dict[str, Any]]:
+    return [
+        {"target": "CKD", "model": "ckd", "features": _ckd_features(), "source": _ckd_df()},
+        {
+            "target": "Delayed remission",
+            "model": "remission",
+            "features": _remission_features(),
+            "source": _remission_df(),
+        },
+    ]
+
+
+def top_modifiable_drivers(
+    patient_ref: str | None,
+    baseline_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Top Modifiable Driver Engine.
+
+    Perturbs each clinically adjustable variable toward its healthier cohort
+    quartile, re-runs the prediction, and ranks variables by the predicted risk
+    reduction for each outcome. Reported as model associations, not advice.
+    """
+    if baseline_inputs is None:
+        baseline_inputs = find_patient_inputs(patient_ref)
+    if baseline_inputs is None:
+        baseline_inputs = {}
+
+    ranges = _modifiable_ranges()
+    specs = _target_specs()
+    baseline_probs = {
+        spec["target"]: round(
+            _prediction_probability(spec["model"], spec["features"], spec["source"], baseline_inputs),
+            4,
+        )
+        for spec in specs
+    }
+
+    rankings: dict[str, list[dict[str, Any]]] = {spec["target"]: [] for spec in specs}
+
+    for mod in MODIFIABLE_FEATURES:
+        feature = mod["feature"]
+        lower_is_better = mod["lowerIsBetter"]
+        if feature not in ranges:
+            continue
+
+        current = baseline_inputs.get(feature)
+        try:
+            current_value = float(current) if current not in (None, "") else None
+        except (TypeError, ValueError):
+            current_value = None
+        if current_value is None:
+            continue
+
+        target_value = ranges[feature]["p25"] if lower_is_better else ranges[feature]["p75"]
+        # Only perturb if the cohort target is genuinely healthier than the
+        # patient's current value; otherwise there is no improvement to claim.
+        if lower_is_better and target_value >= current_value:
+            continue
+        if not lower_is_better and target_value <= current_value:
+            continue
+
+        perturbed_inputs = {**baseline_inputs, feature: target_value}
+
+        for spec in specs:
+            target = spec["target"]
+            new_prob = round(
+                _prediction_probability(spec["model"], spec["features"], spec["source"], perturbed_inputs),
+                4,
+            )
+            reduction = round(baseline_probs[target] - new_prob, 4)
+            if reduction <= 0:
+                continue
+            change = "decrease" if lower_is_better else "increase"
+            rankings[target].append(
+                {
+                    "feature": feature,
+                    "displayName": FEATURE_LABELS.get(feature, feature.title()),
+                    "baselineValue": _clean_value(current_value),
+                    "suggestedValue": round(target_value, 3),
+                    "perturbation": f"Model {change} toward cohort {'25th' if lower_is_better else '75th'} percentile",
+                    "baselineRisk": baseline_probs[target],
+                    "simulatedRisk": new_prob,
+                    "riskReduction": reduction,
+                    "riskReductionPct": round(reduction * 100, 1),
+                    "confidence": _confidence_label(reduction),
+                    "clinicalMeaning": CLINICAL_MEANINGS.get(
+                        feature, "this feature contributes to the model association for this prediction"
+                    ),
+                    "evidenceScope": "model association, not causation",
+                }
+            )
+
+    top_driver: dict[str, Any] = {}
+    for target, drivers in rankings.items():
+        drivers.sort(key=lambda item: item["riskReduction"], reverse=True)
+        for rank, driver in enumerate(drivers, start=1):
+            driver["rank"] = rank
+        top_driver[target] = drivers[0] if drivers else None
+
+    return {
+        "schemaVersion": "1.0",
+        "patientRef": patient_ref or "Manual input",
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "baselineRisk": baseline_probs,
+        "rankings": rankings,
+        "topDriver": top_driver,
+        "safetyNote": SAFETY_NOTE,
+    }
 
 
 def _distribution(series: pd.Series) -> list[dict[str, Any]]:

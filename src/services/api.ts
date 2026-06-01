@@ -1,4 +1,4 @@
-import type { DashboardPayload, RiskResult } from "../types";
+import type { DashboardPayload, DriverEngineResult, RiskResult, SimulationResult } from "../types";
 
 export async function loadDashboard(): Promise<DashboardPayload> {
   const response = await fetch("/api/dashboard");
@@ -19,6 +19,37 @@ export async function predictPatient(
   });
   if (!response.ok) {
     throw new Error("Prediction service is unavailable.");
+  }
+  return response.json();
+}
+
+export async function simulatePatient(
+  patientRef: string,
+  modifiedInputs: Record<string, number | string | null>,
+  baselineInputs: Record<string, number | string | null>,
+): Promise<SimulationResult> {
+  const response = await fetch("/api/simulate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patientRef, modifiedInputs, baselineInputs }),
+  });
+  if (!response.ok) {
+    throw new Error("Simulation service is unavailable.");
+  }
+  return response.json();
+}
+
+export async function loadTopDrivers(
+  patientRef: string,
+  baselineInputs: Record<string, number | string | null>,
+): Promise<DriverEngineResult> {
+  const response = await fetch("/api/drivers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patientRef, baselineInputs }),
+  });
+  if (!response.ok) {
+    throw new Error("Driver engine service is unavailable.");
   }
   return response.json();
 }
