@@ -51,8 +51,6 @@ Do not add generic ML-demo modules such as model leaderboards, treatment recomme
 |   |-- app.py                        # API routes
 |   |-- services.py                   # Dataset, CatBoost, SHAP, and payload logic
 |   `-- __init__.py
-|-- tests/                            # Backend service tests
-|   `-- test_backend_services.py
 |-- data/                             # Anonymized LN dataset and optional processed CSVs
 |   |-- ANONYMOUS DATA EXCEL LN RELAPSE_UKM.xlsx
 |   |-- CB_CKD_cleaned_with_target.csv
@@ -93,7 +91,6 @@ Upload these files and folders:
 - `postcss.config.js`
 - `src/`
 - `backend/`
-- `tests/`
 - `assets/`
 - `model/`
 - `data/`, only if the data is approved for sharing in the target GitHub repository
@@ -103,7 +100,6 @@ Do not upload these generated or local-only folders/files:
 - `node_modules/`
 - `dist/`
 - `backend/__pycache__/`
-- `tests/__pycache__/`
 - `.venv/`, `venv/`, or other Python environments
 - `.env` or files containing API keys/secrets
 - local editor folders such as `.vscode/` or `.idea/`
@@ -122,7 +118,7 @@ npm install
 Install backend dependencies in a Python environment:
 
 ```bash
-python -m pip install flask pandas numpy shap catboost openpyxl pytest
+python -m pip install flask pandas numpy shap catboost openpyxl
 ```
 
 Run the backend API:
@@ -149,19 +145,7 @@ The frontend expects the backend API at:
 http://127.0.0.1:5000
 ```
 
-## Testing And Build
-
-Run frontend tests:
-
-```bash
-npm test
-```
-
-Run backend tests:
-
-```bash
-python -m pytest tests
-```
+## Build
 
 Build the frontend:
 

@@ -1,17 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  ArrowRight,
   BarChart3,
   ClipboardCopy,
   Download,
   FileText,
+  FlaskConical,
   Gauge,
   LineChart as LineChartIcon,
   Loader2,
+  RotateCcw,
   Search,
   ShieldAlert,
+  SlidersHorizontal,
   Sparkles,
   Stethoscope,
+  TrendingDown,
+  Trophy,
   Users,
 } from "lucide-react";
 import {
@@ -29,8 +35,19 @@ import {
   YAxis,
 } from "recharts";
 
-import { loadDashboard, predictPatient } from "./services/api";
-import type { DashboardPayload, ModuleName, PatientRow, RiskCategory, RiskOutcome, RiskResult } from "./types";
+import { loadDashboard, loadTopDrivers, predictPatient, simulatePatient } from "./services/api";
+import type {
+  DashboardPayload,
+  DriverEngineResult,
+  ModifiableDriver,
+  ModuleName,
+  PatientRow,
+  RiskCategory,
+  RiskOutcome,
+  RiskResult,
+  SimulationDelta,
+  SimulationResult,
+} from "./types";
 
 const navIcons = [Users, Stethoscope, ShieldAlert, LineChartIcon, BarChart3, FileText];
 const palette = ["#0f766e", "#2563eb", "#b45309", "#7c3aed", "#64748b"];
@@ -49,8 +66,27 @@ const importantFields = [
   "ACE/ARB",
 ];
 
+// Clinically adjustable continuous variables, mirrors backend MODIFIABLE_FEATURES.
+const modifiableFields = [
+  "CREAT BASELINE",
+  "ALBUMIN BASELINE",
+  "UPCI PRE TX",
+  "C4 PRETX",
+  "CHRONIC INDEX",
+  "ACTIVE INDEX",
+  "GLOBAL SCLEROSIS",
+  "MONTH INTERVAL TO INDUCTION TX",
+];
+
+const medalColors = ["#b45309", "#64748b", "#7c3aed"];
+
 function pct(value: number) {
   return `${Math.round(value * 100)}%`;
+}
+
+function toNumber(value: number | string | null): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function riskClass(category: RiskCategory) {
@@ -124,6 +160,319 @@ function RiskDrivers({ result }: { result: RiskResult }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+function DeltaCard({ delta }: { delta: SimulationDelta }) {
+  const reduced = delta.direction === "reduced";
+  const increased = delta.direction === "increased";
+  const badgeClass = reduced
+    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+    : increased
+      ? "bg-rose-50 text-rose-700 border-rose-200"
+      : "bg-slate-50 text-slate-600 border-slate-200";
+  const sign = delta.deltaPercentagePoints > 0 ? "+" : "";
+  return (
+    <div className="panel p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm font-semibold text-slate-500">{delta.targetEvent}</p>
+        <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass}`}>
+          {sign}{delta.deltaPercentagePoints} pp
+        </span>
+      </div>
+      <div className="mt-4 flex items-center gap-3">
+        <div className="flex-1">
+          <p className="text-xs uppercase tracking-wide text-slate-400">Baseline</p>
+          <p className="text-2xl font-semibold text-ink">{pct(delta.baselineProbability)}</p>
+          <span className={`mt-1 inline-block rounded-full border px-2 py-0.5 text-xs font-semibold ${riskClass(delta.baselineCategory)}`}>
+            {delta.baselineCategory}
+          </span>
+        </div>
+        <ArrowRight className="shrink-0 text-slate-400" size={22} />
+        <div className="flex-1">
+          <p className="text-xs uppercase tracking-wide text-slate-400">Simulated</p>
+          <p className="text-2xl font-semibold text-ink">{pct(delta.simulatedProbability)}</p>
+          <span className={`mt-1 inline-block rounded-full border px-2 py-0.5 text-xs font-semibold ${riskClass(delta.simulatedCategory)}`}>
+            {delta.simulatedCategory}
+          </span>
+        </div>
+      </div>
+      <div className="mt-4 space-y-2">
+        <div className="h-2 rounded-full bg-slate-100">
+          <div className="h-2 rounded-full bg-slate-400" style={{ width: `${Math.round(delta.baselineProbability * 100)}%` }} />
+        </div>
+        <div className="h-2 rounded-full bg-slate-100">
+          <div className={`h-2 rounded-full ${reduced ? "bg-emerald-500" : increased ? "bg-rose-500" : "bg-clinical"}`} style={{ width: `${Math.round(delta.simulatedProbability * 100)}%` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WhatIfExplorer({ selectedPatient }: { selectedPatient: PatientRow }) {
+  const editable = useMemo(
+    () => modifiableFields.filter((field) => field in selectedPatient.inputs),
+    [selectedPatient],
+  );
+  const [simInputs, setSimInputs] = useState<Record<string, number>>({});
+  const [result, setResult] = useState<SimulationResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const seed: Record<string, number> = {};
+    for (const field of editable) {
+      seed[field] = toNumber(selectedPatient.inputs[field]);
+    }
+    setSimInputs(seed);
+    setResult(null);
+    setError("");
+  }, [selectedPatient, editable]);
+
+  const dirty = useMemo(
+    () => editable.some((field) => simInputs[field] !== toNumber(selectedPatient.inputs[field])),
+    [editable, simInputs, selectedPatient],
+  );
+
+  function setField(field: string, value: number) {
+    setSimInputs((current) => ({ ...current, [field]: value }));
+  }
+
+  function reset() {
+    const seed: Record<string, number> = {};
+    for (const field of editable) {
+      seed[field] = toNumber(selectedPatient.inputs[field]);
+    }
+    setSimInputs(seed);
+    setResult(null);
+    setError("");
+  }
+
+  async function runSimulation() {
+    setBusy(true);
+    setError("");
+    try {
+      setResult(await simulatePatient(selectedPatient.id, simInputs, selectedPatient.inputs));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Simulation failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="panel p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <SlidersHorizontal size={18} className="text-clinical" />
+            <h2 className="text-lg font-semibold text-ink">Clinical What-If Explorer</h2>
+          </div>
+          <div className="flex gap-2">
+            <button className="secondary-button" onClick={reset} disabled={busy || !dirty}>
+              <RotateCcw size={16} /> Reset
+            </button>
+            <button className="primary-button" onClick={runSimulation} disabled={busy}>
+              {busy ? <Loader2 className="animate-spin" size={18} /> : <FlaskConical size={18} />}
+              Simulate
+            </button>
+          </div>
+        </div>
+        <p className="mt-2 text-sm text-slate-600">
+          Adjust clinically modifiable variables and re-run the CatBoost prediction to see how predicted CKD and
+          delayed-remission risk change. Model-based scenario analysis only — not a treatment recommendation.
+        </p>
+        <div className="mt-5 grid gap-5 md:grid-cols-2">
+          {editable.map((field) => {
+            const baseline = toNumber(selectedPatient.inputs[field]);
+            const current = simInputs[field] ?? baseline;
+            const sliderMax = Math.max(Math.round((baseline || 1) * 2 * 10) / 10, baseline + 1, 1);
+            const step = sliderMax <= 5 ? 0.1 : 1;
+            const changed = current !== baseline;
+            return (
+              <div key={field} className="rounded-md border border-slate-200 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="label">{field}</span>
+                  <input
+                    className="input w-24 py-1 text-right"
+                    type="number"
+                    step={step}
+                    value={current}
+                    onChange={(event) => setField(field, Number(event.target.value))}
+                  />
+                </div>
+                <input
+                  className="mt-3 w-full accent-clinical"
+                  type="range"
+                  min={0}
+                  max={sliderMax}
+                  step={step}
+                  value={Math.min(current, sliderMax)}
+                  onChange={(event) => setField(field, Number(event.target.value))}
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  Baseline {baseline}
+                  {changed && <span className="ml-1 font-semibold text-clinical">· now {current}</span>}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+        {error && <p className="mt-4 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
+      </div>
+
+      {result && (
+        <>
+          <div className="grid gap-5 lg:grid-cols-2">
+            {result.deltas.map((delta) => <DeltaCard key={delta.target} delta={delta} />)}
+          </div>
+          <div className="panel p-5">
+            <div className="flex items-center gap-2">
+              <Sparkles size={18} className="text-clinical" />
+              <h3 className="text-lg font-semibold text-ink">Updated explanation (simulated scenario)</h3>
+            </div>
+            <p className="mt-3 text-slate-700">{result.simulated.llmExplanation.summary}</p>
+          </div>
+          <RiskDrivers result={result.simulated} />
+          <p className="rounded-md border border-teal-100 bg-teal-50 p-3 text-xs text-teal-900">{result.safetyNote}</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TopModifiableDrivers({ selectedPatient }: { selectedPatient: PatientRow }) {
+  const [result, setResult] = useState<DriverEngineResult | null>(null);
+  const [target, setTarget] = useState<"CKD" | "Delayed remission">("CKD");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setResult(null);
+    setError("");
+  }, [selectedPatient]);
+
+  async function runAnalysis() {
+    setBusy(true);
+    setError("");
+    try {
+      setResult(await loadTopDrivers(selectedPatient.id, selectedPatient.inputs));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Driver analysis failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const drivers = result ? result.rankings[target] : [];
+  const topDriver: ModifiableDriver | null = result ? result.topDriver[target] : null;
+  const chartData = drivers.map((driver) => ({ name: driver.displayName, value: driver.riskReductionPct }));
+
+  return (
+    <div className="panel p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Trophy size={18} className="text-clinical" />
+          <h2 className="text-lg font-semibold text-ink">Top Modifiable Driver Engine</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          {result && (
+            <div className="segmented">
+              <button className={target === "CKD" ? "selected" : ""} onClick={() => setTarget("CKD")}>CKD</button>
+              <button className={target === "Delayed remission" ? "selected" : ""} onClick={() => setTarget("Delayed remission")}>
+                Delayed remission
+              </button>
+            </div>
+          )}
+          <button className="primary-button" onClick={runAnalysis} disabled={busy}>
+            {busy ? <Loader2 className="animate-spin" size={18} /> : <TrendingDown size={18} />}
+            {result ? "Re-run" : "Find drivers"}
+          </button>
+        </div>
+      </div>
+      <p className="mt-2 text-sm text-slate-600">
+        Each clinically adjustable variable is perturbed toward its healthier cohort quartile and the prediction is
+        re-run. Variables are ranked by predicted risk reduction. Model associations only — not treatment advice.
+      </p>
+      {error && <p className="mt-4 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
+
+      {result && (
+        drivers.length === 0 ? (
+          <p className="mt-4 rounded-md border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+            No modifiable variable produced a predicted reduction in {target.toLowerCase()} risk for this patient within
+            the cohort-based analytical range.
+          </p>
+        ) : (
+          <div className="mt-5 space-y-5">
+            {topDriver && (
+              <div className="rounded-lg border border-teal-200 bg-teal-50 p-5">
+                <div className="flex items-center gap-2 text-teal-800">
+                  <Trophy size={18} />
+                  <p className="text-xs font-semibold uppercase tracking-wide">Top modifiable driver</p>
+                </div>
+                <h3 className="mt-2 text-2xl font-semibold text-ink">{topDriver.displayName}</h3>
+                <p className="mt-1 text-sm text-slate-700">
+                  Associated predicted improvement: <span className="font-semibold">{topDriver.riskReductionPct}% reduction</span> in {target.toLowerCase()} risk.
+                </p>
+                <p className="mt-1 text-sm text-slate-600">
+                  Confidence: <span className="font-semibold">{topDriver.confidence}</span> · {topDriver.perturbation}
+                </p>
+                <p className="mt-2 text-xs text-teal-900">Analytical model-based simulation only. Not a treatment recommendation.</p>
+              </div>
+            )}
+
+            <div>
+              <h3 className="text-sm font-semibold text-slate-600">Ranked modifiable factors (predicted % risk reduction)</h3>
+              <div className="mt-3 h-64">
+                <ResponsiveContainer>
+                  <BarChart data={chartData} layout="vertical" margin={{ left: 24, right: 24 }}>
+                    <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                    <XAxis type="number" unit="%" />
+                    <YAxis type="category" dataKey="name" width={150} tick={{ fontSize: 12 }} />
+                    <Tooltip formatter={(value: number) => [`${value}%`, "Risk reduction"]} />
+                    <Bar dataKey="value" radius={[0, 6, 6, 0]}>
+                      {chartData.map((_, index) => (
+                        <Cell key={index} fill={index < 3 ? medalColors[index] : "#0f766e"} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+                <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                  <tr>
+                    <th className="px-4 py-3">Rank</th>
+                    <th className="px-4 py-3">Variable</th>
+                    <th className="px-4 py-3">Baseline → suggested</th>
+                    <th className="px-4 py-3">Predicted reduction</th>
+                    <th className="px-4 py-3">Confidence</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {drivers.map((driver) => (
+                    <tr key={driver.feature} className="hover:bg-slate-50">
+                      <td className="px-4 py-3">
+                        <span className="font-semibold" style={{ color: driver.rank <= 3 ? medalColors[driver.rank - 1] : "#0f172a" }}>
+                          {driver.rank <= 3 ? ["🥇", "🥈", "🥉"][driver.rank - 1] : driver.rank}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 font-semibold text-ink">{driver.displayName}</td>
+                      <td className="px-4 py-3 text-slate-600">{driver.baselineValue} → {driver.suggestedValue}</td>
+                      <td className="px-4 py-3 font-semibold text-emerald-700">−{driver.riskReductionPct} pp</td>
+                      <td className="px-4 py-3 text-slate-600">{driver.confidence}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="rounded-md border border-teal-100 bg-teal-50 p-3 text-xs text-teal-900">{result.safetyNote}</p>
+          </div>
+        )
+      )}
     </div>
   );
 }
@@ -202,13 +551,14 @@ function PatientRiskAssessment({
   setSelectedPatientId: (id: string) => void;
 }) {
   const [inputs, setInputs] = useState<Record<string, number | string | null>>(selectedPatient.inputs);
-  const [result, setResult] = useState<RiskResult>(selectedPatient.prediction);
+  const [result, setResult] = useState<RiskResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setInputs(selectedPatient.inputs);
-    setResult(selectedPatient.prediction);
+    setResult(null);
+    setError("");
   }, [selectedPatient]);
 
   const fields = useMemo(() => importantFields.filter((field) => field in inputs), [inputs]);
@@ -262,25 +612,38 @@ function PatientRiskAssessment({
             </label>
           ))}
         </div>
-        {result.inputValidation.warnings.length > 0 && (
+        {result && result.inputValidation.warnings.length > 0 && (
           <p className="mt-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
             {result.inputValidation.warnings[0]}
           </p>
         )}
         {error && <p className="mt-4 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
       </div>
-      <div className="grid gap-5 lg:grid-cols-2">
-        {result.outcomes.map((outcome) => <OutcomeCard key={outcome.target} outcome={outcome} />)}
-      </div>
-      <div className="panel p-5">
-        <div className="flex items-center gap-2">
-          <Sparkles size={18} className="text-clinical" />
-          <h2 className="text-lg font-semibold text-ink">Clinician-friendly explanation</h2>
+      {result && result.predictionKind === "full" ? (
+        <>
+          <div className="grid gap-5 lg:grid-cols-2">
+            {result.outcomes.map((outcome) => <OutcomeCard key={outcome.target} outcome={outcome} />)}
+          </div>
+          <div className="panel p-5">
+            <div className="flex items-center gap-2">
+              <Sparkles size={18} className="text-clinical" />
+              <h2 className="text-lg font-semibold text-ink">Clinician-friendly explanation</h2>
+            </div>
+            <p className="mt-3 text-slate-700">{result.llmExplanation.summary}</p>
+            <p className="mt-3 text-sm font-semibold text-slate-600">{result.llmExplanation.safetyNote}</p>
+          </div>
+          <RiskDrivers result={result} />
+        </>
+      ) : (
+        <div className="panel p-5">
+          <h2 className="text-lg font-semibold text-ink">Ready for model inference</h2>
+          <p className="mt-2 text-sm text-slate-600">
+            Select a sample patient or edit fields, then click Generate to run full CatBoost + local SHAP prediction for this assessment.
+          </p>
         </div>
-        <p className="mt-3 text-slate-700">{result.llmExplanation.summary}</p>
-        <p className="mt-3 text-sm font-semibold text-slate-600">{result.llmExplanation.safetyNote}</p>
-      </div>
-      <RiskDrivers result={result} />
+      )}
+      <WhatIfExplorer selectedPatient={selectedPatient} />
+      <TopModifiableDrivers selectedPatient={selectedPatient} />
     </section>
   );
 }

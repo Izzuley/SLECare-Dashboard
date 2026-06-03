@@ -341,11 +341,6 @@ Export:
 - PDF
 - Word/report text if feasible
 
-Testing:
-
-- Vitest + jsdom for frontend
-- lightweight backend smoke tests if backend is created
-
 Package manager:
 
 - npm

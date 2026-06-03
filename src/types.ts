@@ -34,6 +34,7 @@ export type RiskResult = {
   schemaVersion: string;
   patientRef: string;
   generatedAt: string;
+  predictionKind: "summary" | "full";
   predictionSource: "catboost" | "mock";
   shapSource: "local_shap" | "mock_shap";
   inputValidation: { missingRequiredFields: string[]; warnings: string[] };
@@ -72,6 +73,55 @@ export type PatientRow = {
     urgency: RiskCategory;
     mainReason: string;
   };
+};
+
+export type SimulationDelta = {
+  target: "CKD" | "Delayed remission";
+  targetEvent: string;
+  baselineProbability: number;
+  simulatedProbability: number;
+  delta: number;
+  deltaPercentagePoints: number;
+  baselineCategory: RiskCategory;
+  simulatedCategory: RiskCategory;
+  direction: "reduced" | "increased" | "unchanged";
+};
+
+export type SimulationResult = {
+  schemaVersion: string;
+  patientRef: string;
+  generatedAt: string;
+  modifiedInputs: Record<string, number | string | null>;
+  baseline: RiskResult;
+  simulated: RiskResult;
+  deltas: SimulationDelta[];
+  safetyNote: string;
+};
+
+export type ModifiableDriver = {
+  feature: string;
+  displayName: string;
+  baselineValue: number | string | null;
+  suggestedValue: number;
+  perturbation: string;
+  baselineRisk: number;
+  simulatedRisk: number;
+  riskReduction: number;
+  riskReductionPct: number;
+  confidence: "Low" | "Low-Moderate" | "Moderate";
+  clinicalMeaning: string;
+  evidenceScope: string;
+  rank: number;
+};
+
+export type DriverEngineResult = {
+  schemaVersion: string;
+  patientRef: string;
+  generatedAt: string;
+  baselineRisk: Record<"CKD" | "Delayed remission", number>;
+  rankings: Record<"CKD" | "Delayed remission", ModifiableDriver[]>;
+  topDriver: Record<"CKD" | "Delayed remission", ModifiableDriver | null>;
+  safetyNote: string;
 };
 
 export type DashboardPayload = {
