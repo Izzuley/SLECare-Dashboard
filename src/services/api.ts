@@ -1,4 +1,10 @@
-import type { DashboardPayload, DriverEngineResult, RiskResult, SimulationResult } from "../types";
+import type {
+  DashboardPayload,
+  DriverEngineResult,
+  RiskResult,
+  SimulationResult,
+  TwinsResult,
+} from "../types";
 
 export async function loadDashboard(): Promise<DashboardPayload> {
   const response = await fetch("/api/dashboard");
@@ -35,6 +41,22 @@ export async function simulatePatient(
   });
   if (!response.ok) {
     throw new Error("Simulation service is unavailable.");
+  }
+  return response.json();
+}
+
+export async function loadTwins(
+  patientRef: string,
+  inputs: Record<string, number | string | null>,
+  n = 12,
+): Promise<TwinsResult> {
+  const response = await fetch("/api/twins", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patientRef, inputs, n }),
+  });
+  if (!response.ok) {
+    throw new Error("Twin constellation service is unavailable.");
   }
   return response.json();
 }

@@ -63,3 +63,12 @@
     @apply bg-clinical text-white;
   }
 }
+
+@keyframes twin-pulse {
+  0% { r: 7; opacity: 1; }
+  50% { r: 11; opacity: 0.55; }
+  100% { r: 7; opacity: 1; }
+}
+.twin-you-marker { animation: twin-pulse 1.8s ease-in-out infinite; }
+.twin-lens-btn { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.8rem; }
+.twin-lens-btn.active { background: #0f766e; color: #fff; }

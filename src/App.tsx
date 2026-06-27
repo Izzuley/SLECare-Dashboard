@@ -10,6 +10,7 @@ import {
   Gauge,
   LineChart as LineChartIcon,
   Loader2,
+  Orbit,
   RotateCcw,
   Search,
   ShieldAlert,
@@ -36,6 +37,7 @@ import {
 } from "recharts";
 
 import { loadDashboard, loadTopDrivers, predictPatient, simulatePatient } from "./services/api";
+import { TwinsModule } from "./components/TwinsModule";
 import type {
   DashboardPayload,
   DriverEngineResult,
@@ -49,7 +51,7 @@ import type {
   SimulationResult,
 } from "./types";
 
-const navIcons = [Users, Stethoscope, ShieldAlert, LineChartIcon, BarChart3, FileText];
+const navIcons = [Users, Stethoscope, ShieldAlert, LineChartIcon, BarChart3, FileText, Orbit];
 const palette = ["#0f766e", "#2563eb", "#b45309", "#7c3aed", "#64748b"];
 const importantFields = [
   "CREAT BASELINE",
@@ -87,6 +89,14 @@ function pct(value: number) {
 function toNumber(value: number | string | null): number {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// Quote/escape a CSV field and neutralize spreadsheet formula injection: a cell
+// beginning with = + - @ (or tab/CR) is executed as a formula by Excel/Sheets.
+function csvCell(value: string | number | null | undefined): string {
+  let s = value === null || value === undefined ? "" : String(value);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
 }
 
 function riskClass(category: RiskCategory) {
@@ -273,7 +283,7 @@ function WhatIfExplorer({ selectedPatient }: { selectedPatient: PatientRow }) {
             <button className="secondary-button" onClick={reset} disabled={busy || !dirty}>
               <RotateCcw size={16} /> Reset
             </button>
-            <button className="primary-button" onClick={runSimulation} disabled={busy}>
+            <button className="primary-button" onClick={runSimulation} disabled={busy || !dirty}>
               {busy ? <Loader2 className="animate-spin" size={18} /> : <FlaskConical size={18} />}
               Simulate
             </button>
@@ -496,6 +506,14 @@ function CohortOverview({ data }: { data: DashboardPayload }) {
           detail="Rows aligned to delayed-remission CatBoost features."
         />
       </div>
+      {data.cohort.rawRecords > data.patients.length && (
+        <p className="rounded-md border border-teal-100 bg-teal-50 p-3 text-xs text-teal-900">
+          Per-patient prediction, timeline, and the high-risk list cover the {data.patients.length} model-ready records.
+          The remaining {data.cohort.rawRecords - data.patients.length} of {data.cohort.rawRecords} raw records lack the
+          complete CatBoost feature set and are excluded from individual scoring. Cohort distributions above still reflect
+          all available data.
+        </p>
+      )}
       <div className="grid gap-5 lg:grid-cols-2">
         <ChartPanel title="CKD target distribution" data={data.cohort.ckdDistribution} />
         <ChartPanel title="Delayed-remission target distribution" data={data.cohort.delayedRemissionDistribution} />
@@ -600,7 +618,7 @@ function PatientRiskAssessment({
           value={selectedPatient.id}
           onChange={(event) => setSelectedPatientId(event.target.value)}
         >
-          {data.patients.slice(0, 60).map((patient) => (
+          {data.patients.map((patient) => (
             <option key={patient.id} value={patient.id}>{patient.displayId}</option>
           ))}
         </select>
@@ -655,13 +673,26 @@ function HighRiskPatients({ patients, onSelectAssessment, onSelectTimeline }: {
 }) {
   const [query, setQuery] = useState("");
   const [risk, setRisk] = useState("All");
+  const [page, setPage] = useState(0);
+  const pageSize = 15;
+
   const sorted = useMemo(() => {
     return [...patients]
       .filter((patient) => risk === "All" || patient.priority.urgency === risk)
       .filter((patient) => patient.displayId.toLowerCase().includes(query.toLowerCase()))
-      .sort((a, b) => b.priority.combinedRisk - a.priority.combinedRisk)
-      .slice(0, 60);
+      .sort((a, b) => b.priority.combinedRisk - a.priority.combinedRisk);
   }, [patients, query, risk]);
+
+  // Return to the first page whenever the filter set changes.
+  useEffect(() => {
+    setPage(0);
+  }, [query, risk]);
+
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const visible = sorted.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  const rangeStart = sorted.length === 0 ? 0 : safePage * pageSize + 1;
+  const rangeEnd = Math.min(sorted.length, (safePage + 1) * pageSize);
 
   return (
     <section className="space-y-6">
@@ -699,7 +730,7 @@ function HighRiskPatients({ patients, onSelectAssessment, onSelectTimeline }: {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {sorted.map((patient) => {
+              {visible.map((patient) => {
                 const ckd = patient.prediction.outcomes[0];
                 const remission = patient.prediction.outcomes[1];
                 return (
@@ -722,9 +753,43 @@ function HighRiskPatients({ patients, onSelectAssessment, onSelectTimeline }: {
                   </tr>
                 );
               })}
+              {visible.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-4 py-8 text-center text-sm text-slate-500">
+                    No patients match the current search and risk filter.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
+        {sorted.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 px-4 py-3 text-sm text-slate-600">
+            <span>
+              Showing <span className="font-semibold text-ink">{rangeStart}–{rangeEnd}</span> of{" "}
+              <span className="font-semibold text-ink">{sorted.length}</span> patients
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                className="secondary-button"
+                onClick={() => setPage((current) => Math.max(0, current - 1))}
+                disabled={safePage === 0}
+              >
+                Previous
+              </button>
+              <span className="px-1 text-xs text-slate-500">
+                Page {safePage + 1} / {pageCount}
+              </span>
+              <button
+                className="secondary-button"
+                onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}
+                disabled={safePage >= pageCount - 1}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -746,7 +811,7 @@ function PatientTimeline({ selectedPatient, patients, setSelectedPatientId }: {
       <div className="panel p-5">
         <label className="label" htmlFor="timeline-select">Patient</label>
         <select id="timeline-select" className="input mt-2" value={selectedPatient.id} onChange={(event) => setSelectedPatientId(event.target.value)}>
-          {patients.slice(0, 60).map((patient) => <option key={patient.id} value={patient.id}>{patient.displayId}</option>)}
+          {patients.map((patient) => <option key={patient.id} value={patient.id}>{patient.displayId}</option>)}
         </select>
         <div className="mt-5 grid gap-4 md:grid-cols-4">
           <StatCard label="Biopsy date" value={selectedPatient.biopsyDate?.slice(0, 10) ?? "Unavailable"} detail="From raw cohort workbook." />
@@ -827,6 +892,7 @@ function GlobalRiskDrivers({ data }: { data: DashboardPayload }) {
 
 function ResearchExport({ data }: { data: DashboardPayload }) {
   const highRiskCount = data.patients.filter((patient) => patient.priority.urgency === "High").length;
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
   const text = `SLECare INNOVERSE prototype summary
 
 Cohort: ${data.cohort.rawRecords} raw LN records; ${data.cohort.ckdModelReadyRecords} CKD model-ready records; ${data.cohort.remissionModelReadyRecords} remission model-ready records.
@@ -835,15 +901,29 @@ High-priority prototype review list: ${highRiskCount} sample rows classified as 
 Global SHAP review: CKD drivers include baseline creatinine, race code, lupus anticoagulant, pretreatment C4, and chronicity index. Delayed-remission drivers include CKD marker, induction interval, race code, global sclerosis, ACE/ARB marker, and lupus anticoagulant.
 Safety wording: This is a decision-support risk prediction prototype and requires clinical validation before real-world deployment.`;
 
+  async function copySummary() {
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      setCopyState("copied");
+    } catch {
+      setCopyState("error");
+    }
+    window.setTimeout(() => setCopyState("idle"), 2000);
+  }
+
   function downloadCsv() {
-    const rows = ["patient,ckd_risk,delayed_remission_risk,priority,reason"].concat(
+    const header = ["patient", "ckd_risk", "delayed_remission_risk", "priority", "reason"].map(csvCell).join(",");
+    const rows = [header].concat(
       data.patients.map((patient) => {
         const ckd = patient.prediction.outcomes[0];
         const remission = patient.prediction.outcomes[1];
-        return [patient.id, ckd.probability, remission.probability, patient.priority.urgency, `"${patient.priority.mainReason}"`].join(",");
+        return [patient.id, ckd.probability, remission.probability, patient.priority.urgency, patient.priority.mainReason]
+          .map(csvCell)
+          .join(",");
       }),
     );
-    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const blob = new Blob([rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -860,8 +940,9 @@ Safety wording: This is a decision-support risk prediction prototype and require
           <p>Export-ready summaries for abstracts, reports, posters, and research review.</p>
         </div>
         <div className="flex gap-2">
-          <button className="secondary-button" onClick={() => navigator.clipboard.writeText(text)}>
-            <ClipboardCopy size={17} /> Copy
+          <button className="secondary-button" onClick={copySummary}>
+            <ClipboardCopy size={17} />
+            {copyState === "copied" ? "Copied" : copyState === "error" ? "Copy failed" : "Copy"}
           </button>
           <button className="primary-button" onClick={downloadCsv}>
             <Download size={17} /> CSV
@@ -971,6 +1052,7 @@ export default function App() {
         )}
         {active === "Global Risk Drivers" && <GlobalRiskDrivers data={data} />}
         {active === "Research Export" && <ResearchExport data={data} />}
+        {active === "Patient Twins" && <TwinsModule selectedPatient={selectedPatient} />}
       </main>
     </div>
   );

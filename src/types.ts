@@ -4,7 +4,8 @@ export type ModuleName =
   | "High-Risk Patients"
   | "Patient Timeline"
   | "Global Risk Drivers"
-  | "Research Export";
+  | "Research Export"
+  | "Patient Twins";
 
 export type RiskCategory = "Low" | "Moderate" | "High";
 
@@ -37,7 +38,7 @@ export type RiskResult = {
   predictionKind: "summary" | "full";
   predictionSource: "catboost" | "mock";
   shapSource: "local_shap" | "mock_shap";
-  inputValidation: { missingRequiredFields: string[]; warnings: string[] };
+  inputValidation: { missingRequiredFields: string[]; invalidFields?: string[]; warnings: string[] };
   outcomes: RiskOutcome[];
   llmExplanation: {
     summary: string;
@@ -121,6 +122,54 @@ export type DriverEngineResult = {
   baselineRisk: Record<"CKD" | "Delayed remission", number>;
   rankings: Record<"CKD" | "Delayed remission", ModifiableDriver[]>;
   topDriver: Record<"CKD" | "Delayed remission", ModifiableDriver | null>;
+  safetyNote: string;
+};
+
+export type TwinLens = "ckd" | "delayedRemission" | "relapse";
+
+export type TwinOutcomes = Record<TwinLens, boolean | null>;
+
+export type TwinTrajectoryPoint = {
+  month: number;
+  upci: number | null;
+  creatinine: number | null;
+};
+
+export type TwinMatchedFeature = {
+  feature: string;
+  displayName: string;
+  queryValue: number | string | boolean | null;
+  twinValue: number | string | boolean | null;
+};
+
+export type CohortPoint = {
+  id: string;
+  x: number;
+  y: number;
+  outcomes: TwinOutcomes;
+};
+
+export type TwinPoint = CohortPoint & {
+  displayId: string;
+  similarity: number;
+  trajectory: TwinTrajectoryPoint[];
+  matchedOn: TwinMatchedFeature[];
+};
+
+export type TwinOutcomeBreakdown = Record<
+  TwinLens,
+  { positive: number; total: number; pct: number }
+>;
+
+export type TwinsResult = {
+  schemaVersion: string;
+  patientRef: string;
+  generatedAt: string;
+  n: number;
+  query: { x: number; y: number };
+  cohort: CohortPoint[];
+  twins: TwinPoint[];
+  outcomeBreakdown: TwinOutcomeBreakdown;
   safetyNote: string;
 };
 

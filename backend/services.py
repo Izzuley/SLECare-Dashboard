@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import threading
 from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ MODULES = [
     "Patient Timeline",
     "Global Risk Drivers",
     "Research Export",
+    "Patient Twins",
 ]
 
 CKD_TARGET = "CKD"
@@ -65,6 +67,9 @@ CLINICAL_MEANINGS = {
 
 PREDICTION_CACHE_MAX_SIZE = 256
 _PREDICTION_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+# Flask's dev server is threaded; guard the LRU ordering mutations so concurrent
+# requests cannot corrupt the OrderedDict (move_to_end / popitem races).
+_PREDICTION_CACHE_LOCK = threading.Lock()
 
 # Clinically adjustable continuous variables for the What-If Explorer and the
 # Top Modifiable Driver Engine. Demographics (RACE/GENDER) and binary serology
@@ -98,6 +103,38 @@ def _clean_value(value: Any) -> Any:
     if pd.isna(value):
         return None
     return value
+
+
+def _is_model_numeric(value: Any) -> bool:
+    """True if a provided input value can be used as a model float.
+
+    Empty/None values are not "invalid" - they are simply missing and get
+    imputed with cohort medians. Anything else that cannot be parsed as a
+    finite float (e.g. a stray text entry) is flagged as invalid input.
+    """
+    if value is None or value == "":
+        return True
+    try:
+        return not math.isnan(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _to_model_float(value: Any, fallback: float) -> float:
+    """Coerce a raw input to a model-ready float, falling back when unusable.
+
+    Guards every model entry point: missing, empty, non-numeric, or NaN values
+    all resolve to the supplied cohort-median fallback instead of raising.
+    """
+    if value is None or value == "":
+        return fallback
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if math.isnan(parsed):
+        return fallback
+    return parsed
 
 
 def _risk_category(probability: float) -> str:
@@ -155,10 +192,10 @@ def _feature_frame(values: dict[str, Any], features: list[str], source: pd.DataF
     medians = source[features].median(numeric_only=True).to_dict()
     row = {}
     for feature in features:
-        value = values.get(feature)
-        if value is None or value == "":
-            value = medians.get(feature, 0)
-        row[feature] = float(value)
+        fallback = medians.get(feature, 0.0)
+        if fallback is None or (isinstance(fallback, float) and math.isnan(fallback)):
+            fallback = 0.0
+        row[feature] = _to_model_float(values.get(feature), float(fallback))
     return pd.DataFrame([row], columns=features)
 
 
@@ -191,22 +228,25 @@ def _prediction_cache_key(inputs: dict[str, Any], patient_ref: str | None) -> st
 
 
 def _prediction_cache_get(cache_key: str) -> dict[str, Any] | None:
-    cached = _PREDICTION_CACHE.get(cache_key)
-    if cached is None:
-        return None
-    _PREDICTION_CACHE.move_to_end(cache_key)
-    return deepcopy(cached)
+    with _PREDICTION_CACHE_LOCK:
+        cached = _PREDICTION_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _PREDICTION_CACHE.move_to_end(cache_key)
+        return deepcopy(cached)
 
 
 def _prediction_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
-    _PREDICTION_CACHE[cache_key] = deepcopy(payload)
-    _PREDICTION_CACHE.move_to_end(cache_key)
-    while len(_PREDICTION_CACHE) > PREDICTION_CACHE_MAX_SIZE:
-        _PREDICTION_CACHE.popitem(last=False)
+    with _PREDICTION_CACHE_LOCK:
+        _PREDICTION_CACHE[cache_key] = deepcopy(payload)
+        _PREDICTION_CACHE.move_to_end(cache_key)
+        while len(_PREDICTION_CACHE) > PREDICTION_CACHE_MAX_SIZE:
+            _PREDICTION_CACHE.popitem(last=False)
 
 
 def _clear_prediction_cache() -> None:
-    _PREDICTION_CACHE.clear()
+    with _PREDICTION_CACHE_LOCK:
+        _PREDICTION_CACHE.clear()
 
 
 def _driver_payload(feature: str, value: Any, shap_value: float, rank: int) -> dict[str, Any]:
@@ -230,12 +270,18 @@ def _local_shap(model_name: str, frame: pd.DataFrame, features: list[str]) -> tu
         values = values[-1]
     shap_row = np.asarray(values)[0]
     ordered = sorted(zip(features, frame.iloc[0].tolist(), shap_row), key=lambda item: abs(item[2]), reverse=True)
-    risk = [_driver_payload(feature, value, shap_value, i + 1) for i, (feature, value, shap_value) in enumerate(ordered) if shap_value > 0][:5]
+    # Rank within each list (1..n), not the global |SHAP| order, so the top risk
+    # driver is rank 1 and ranks are contiguous in the API / CSV contract.
+    risk_items = [item for item in ordered if item[2] > 0][:5]
+    protective_items = [item for item in ordered if item[2] < 0][:3]
+    risk = [
+        _driver_payload(feature, value, shap_value, rank)
+        for rank, (feature, value, shap_value) in enumerate(risk_items, start=1)
+    ]
     protective = [
-        _driver_payload(feature, value, shap_value, i + 1)
-        for i, (feature, value, shap_value) in enumerate(ordered)
-        if shap_value < 0
-    ][:3]
+        _driver_payload(feature, value, shap_value, rank)
+        for rank, (feature, value, shap_value) in enumerate(protective_items, start=1)
+    ]
     return risk, protective
 
 
@@ -356,17 +402,44 @@ def explain_payload(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _input_validation(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Report missing and non-numeric fields for a prediction request.
+
+    Both missing and invalid (non-numeric) entries are imputed with cohort
+    medians downstream; this surfaces that to the clinician instead of failing.
+    """
+    inputs = inputs or {}
+    all_features = sorted(set(_ckd_features() + _remission_features()))
+    missing = [feature for feature in all_features if inputs.get(feature) in (None, "")]
+    invalid = [
+        feature
+        for feature in all_features
+        if inputs.get(feature) not in (None, "") and not _is_model_numeric(inputs.get(feature))
+    ]
+    warnings: list[str] = []
+    if invalid:
+        warnings.append(
+            "Non-numeric entries ("
+            + ", ".join(FEATURE_LABELS.get(feature, feature) for feature in invalid)
+            + ") were ignored and imputed with model-ready cohort medians."
+        )
+    if missing:
+        warnings.append(
+            "Missing fields were imputed with model-ready cohort medians for prototype prediction."
+        )
+    return {"missingRequiredFields": missing, "invalidFields": invalid, "warnings": warnings}
+
+
 def predict_patient(inputs: dict[str, Any], patient_ref: str | None = None) -> dict[str, Any]:
     cache_key = _prediction_cache_key(inputs, patient_ref)
+    # Validation is recomputed per request and overrides any cached copy so a
+    # cache hit never replays a stale warning set for differently-validated inputs.
+    validation = _input_validation(inputs)
     cached_result = _prediction_cache_get(cache_key)
     if cached_result is not None:
+        cached_result["inputValidation"] = validation
         return cached_result
 
-    missing = [
-        feature
-        for feature in sorted(set(_ckd_features() + _remission_features()))
-        if inputs.get(feature) in (None, "")
-    ]
     result = {
         "schemaVersion": "1.0",
         "patientRef": patient_ref or "Manual input",
@@ -374,14 +447,7 @@ def predict_patient(inputs: dict[str, Any], patient_ref: str | None = None) -> d
         "predictionKind": "full",
         "predictionSource": "catboost",
         "shapSource": "local_shap",
-        "inputValidation": {
-            "missingRequiredFields": missing,
-            "warnings": [
-                "Missing fields were imputed with model-ready cohort medians for prototype prediction."
-            ]
-            if missing
-            else [],
-        },
+        "inputValidation": validation,
         "outcomes": [
             _predict_one(
                 "CKD",
@@ -436,6 +502,232 @@ def _modifiable_ranges() -> dict[str, dict[str, float]]:
             "max": float(series.max()),
         }
     return ranges
+
+
+TWIN_DEFAULT_N = 12
+TWIN_MIN_N = 3
+TWIN_MAX_N = 30
+
+# (month, raw column) pairs for a twin's real proteinuria trajectory.
+TWIN_TRAJECTORY_COLS = [
+    (0, "UPCI PRE TX"),
+    (3, "UPCI 3 MTH"),
+    (6, "UPCI 6 MTH"),
+    (12, "UPCI 12 MTH"),
+    (18, "UPCI 18 MTH"),
+    (24, "UPCI 24MTH"),
+]
+
+
+def _twin_feature_order() -> list[str]:
+    """Feature union used for twin similarity - matches _patient_rows() inputs."""
+    return sorted(set(_ckd_features() + _remission_features()))
+
+
+def _twin_float(value: Any) -> float:
+    if value is None or value == "":
+        return float("nan")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return parsed
+
+
+@lru_cache(maxsize=1)
+def _twin_matrix_imputed() -> tuple[np.ndarray, tuple[str, ...]]:
+    features = _twin_feature_order()
+    rows = _patient_rows()
+    mat = np.array(
+        [[_twin_float(row["inputs"].get(feature)) for feature in features] for row in rows],
+        dtype=float,
+    )
+    col_median = np.nanmedian(mat, axis=0)
+    col_median = np.where(np.isnan(col_median), 0.0, col_median)
+    nan_mask = np.isnan(mat)
+    mat[nan_mask] = np.take(col_median, np.where(nan_mask)[1])
+    return mat, tuple(features)
+
+
+@lru_cache(maxsize=1)
+def _twin_median() -> np.ndarray:
+    mat, _ = _twin_matrix_imputed()
+    return np.median(mat, axis=0)
+
+
+@lru_cache(maxsize=1)
+def _twin_stats() -> tuple[np.ndarray, np.ndarray]:
+    mat, _ = _twin_matrix_imputed()
+    mean = mat.mean(axis=0)
+    std = mat.std(axis=0)
+    std = np.where(std == 0, 1.0, std)
+    return mean, std
+
+
+@lru_cache(maxsize=1)
+def _twin_standardized() -> np.ndarray:
+    mat, _ = _twin_matrix_imputed()
+    mean, std = _twin_stats()
+    return (mat - mean) / std
+
+
+@lru_cache(maxsize=1)
+def _twin_pca() -> tuple[Any, np.ndarray]:
+    from sklearn.decomposition import PCA
+
+    z = _twin_standardized()
+    pca = PCA(n_components=2, random_state=0)
+    coords = pca.fit_transform(z)
+    return pca, coords
+
+
+TWIN_SAFETY_NOTE = (
+    "Case-based model association, not diagnosis or treatment guidance; "
+    "requires clinical validation before real-world use."
+)
+
+
+def _twin_bool(value: Any, positive: float) -> bool | None:
+    cleaned = _clean_value(value)
+    if cleaned is None:
+        return None
+    try:
+        return float(cleaned) == positive
+    except (TypeError, ValueError):
+        return None
+
+
+def _twin_outcomes(index: int) -> dict[str, bool | None]:
+    ckd_val = _ckd_df().iloc[index].get(CKD_TARGET)
+    rem_val = _remission_df().iloc[index].get(REMISSION_TARGET)
+    relapse_val = _raw_df().iloc[index].get("RELAPSE WITHIN 12 MONTH")
+    return {
+        "ckd": _twin_bool(ckd_val, 1.0),
+        # delayed remission = complete remission NOT achieved by 12 months
+        "delayedRemission": _twin_bool(rem_val, 0.0),
+        "relapse": _twin_bool(relapse_val, 1.0),
+    }
+
+
+def _twin_trajectory(index: int) -> list[dict[str, Any]]:
+    raw_row = _raw_df().iloc[index]
+    points = []
+    for month, column in TWIN_TRAJECTORY_COLS:
+        if month == 0:
+            creatinine = _clean_value(raw_row.get("CREAT BASELINE"))
+        elif month == 24:
+            creatinine = _clean_value(raw_row.get("CREAT 24 MONTH"))
+        else:
+            creatinine = None
+        points.append(
+            {"month": month, "upci": _clean_value(raw_row.get(column)), "creatinine": creatinine}
+        )
+    return points
+
+
+def _twin_matched_on(
+    z_query: np.ndarray, z_twin: np.ndarray, twin_inputs: dict[str, Any], query_inputs: dict[str, Any]
+) -> list[dict[str, Any]]:
+    features = _twin_feature_order()
+    diffs = np.abs(z_query - z_twin)
+    order = np.argsort(diffs)[:3]
+    matched = []
+    for j in order:
+        feature = features[int(j)]
+        matched.append(
+            {
+                "feature": feature,
+                "displayName": FEATURE_LABELS.get(feature, feature.title()),
+                "queryValue": _clean_value(query_inputs.get(feature)),
+                "twinValue": _clean_value(twin_inputs.get(feature)),
+            }
+        )
+    return matched
+
+
+def _project_query(inputs: dict[str, Any]) -> tuple[np.ndarray, list[float]]:
+    features = _twin_feature_order()
+    mean, std = _twin_stats()
+    median = _twin_median()
+    raw = np.array([_twin_float(inputs.get(feature)) for feature in features], dtype=float)
+    raw = np.where(np.isnan(raw), median, raw)
+    z = (raw - mean) / std
+    pca, _ = _twin_pca()
+    xy = pca.transform(z.reshape(1, -1))[0]
+    return z, [float(xy[0]), float(xy[1])]
+
+
+def find_twins(
+    patient_ref: str | None,
+    inputs: dict[str, Any] | None,
+    n: int = TWIN_DEFAULT_N,
+) -> dict[str, Any]:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = TWIN_DEFAULT_N
+    n = max(TWIN_MIN_N, min(TWIN_MAX_N, n))
+
+    if not inputs:
+        inputs = find_patient_inputs(patient_ref) or {}
+
+    z_query, query_xy = _project_query(inputs)
+    z_cohort = _twin_standardized()
+    _, coords = _twin_pca()
+    rows = _patient_rows()
+
+    distances = np.linalg.norm(z_cohort - z_query, axis=1)
+    d_max = float(distances.max()) or 1.0
+    order = np.argsort(distances)
+    twin_indices = order[: min(n, len(rows))]
+
+    cohort = [
+        {
+            "id": rows[i]["id"],
+            "x": float(coords[i][0]),
+            "y": float(coords[i][1]),
+            "outcomes": _twin_outcomes(i),
+        }
+        for i in range(len(rows))
+    ]
+
+    twins = []
+    for i in twin_indices:
+        i = int(i)
+        twins.append(
+            {
+                "id": rows[i]["id"],
+                "displayId": rows[i]["displayId"],
+                "x": float(coords[i][0]),
+                "y": float(coords[i][1]),
+                "similarity": round(100.0 * (1.0 - float(distances[i]) / d_max), 1),
+                "outcomes": _twin_outcomes(i),
+                "trajectory": _twin_trajectory(i),
+                "matchedOn": _twin_matched_on(z_query, z_cohort[i], rows[i]["inputs"], inputs),
+            }
+        )
+
+    breakdown = {}
+    for lens in ("ckd", "delayedRemission", "relapse"):
+        known = [t["outcomes"][lens] for t in twins if t["outcomes"][lens] is not None]
+        positive = sum(1 for value in known if value)
+        breakdown[lens] = {
+            "positive": positive,
+            "total": len(known),
+            "pct": round(100.0 * positive / len(known), 1) if known else 0.0,
+        }
+
+    return {
+        "schemaVersion": "1.0",
+        "patientRef": patient_ref or "Manual input",
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "n": n,
+        "query": {"x": query_xy[0], "y": query_xy[1]},
+        "cohort": cohort,
+        "twins": twins,
+        "outcomeBreakdown": breakdown,
+        "safetyNote": TWIN_SAFETY_NOTE,
+    }
 
 
 def _confidence_label(reduction: float) -> str:
@@ -710,7 +1002,11 @@ def _patient_rows() -> list[dict[str, Any]]:
             elif feature in raw.columns:
                 inputs[feature] = _clean_value(raw_row[feature])
         ref = str(_clean_value(raw_row.get("PATIENT ID")) or f"P{index + 1:03d}")
-        prediction = predict_patient(inputs, ref)
+        # Cohort table only needs probabilities + a triage reason, so use the
+        # SHAP-free summary path here. Full local SHAP is computed on demand in
+        # Patient Risk Assessment via /api/predict. Probabilities are identical
+        # (same CatBoost models); this avoids running TreeExplainer 174x on load.
+        prediction = _fast_prediction_summary(inputs, ref)
         ckd_outcome, remission_outcome = prediction["outcomes"]
         main_reason = ", ".join(driver["displayName"] for driver in ckd_outcome["topRiskDrivers"][:2])
         if remission_outcome["riskCategory"] == "High":
